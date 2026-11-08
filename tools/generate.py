@@ -1,5 +1,7 @@
 import base64, glob, hashlib, html, json, os, re, shlex, shutil, subprocess, sys
 
+NEXA_TPL = 5
+
 c = json.loads(os.environ["CFG"])
 D, W, STATE = "build_app", "src_work", ".nexa.json"
 GEN = []
@@ -57,11 +59,12 @@ def keystore():
     return ks, kp, al
 
 
-def unzip():
+def unzip(z=None):
     import zipfile
-    z = c.get("zip", "")
-    if not re.match(r"^uploads/[\w.-]+\.zip$", z) or not os.path.exists(z):
-        fail("File ZIP tidak ditemukan di repo. Unggah ulang dari tab Build.")
+    if z is None:
+        z = c.get("zip", "")
+        if not re.match(r"^uploads/[\w.-]+\.zip$", z) or not os.path.exists(z):
+            fail("File ZIP tidak ditemukan di repo. Unggah ulang dari tab Build.")
     print("::group::Mengekstrak ZIP")
     zipfile.ZipFile(z).extractall(W)
     items = [x for x in os.listdir(W) if x != "__MACOSX"]
@@ -71,12 +74,30 @@ def unzip():
     return one if one and os.path.isdir(one) else W
 
 
+def fetchzip():
+    import zipfile
+    url = (c.get("src") or "").strip()
+    if not re.match(r"^https?://\S+$", url):
+        fail("URL ZIP tidak valid.")
+    print("::group::Mengunduh ZIP")
+    sh("curl", "-fL", "--max-time", "300", "--max-filesize", "209715200", "-o", "dl.zip", url)
+    print("::endgroup::")
+    if not zipfile.is_zipfile("dl.zip"):
+        fail("Tautan itu bukan file ZIP yang valid.")
+    return unzip("dl.zip")
+
+
 def prep():
+    sr = c.get("sr")
+    if sr not in ("scratch", "repo", "zip", "ziplink"):
+        fail("Konfigurasi sumber proyek tidak dikenali. Sinkronkan repo build dengan template terbaru (tombol di tab Build).")
     kind, work = "generated", "."
-    if c.get("sr") in ("repo", "zip"):
+    if sr in ("repo", "zip", "ziplink"):
         root = W
-        if c["sr"] == "zip":
+        if sr == "zip":
             root = unzip()
+        elif sr == "ziplink":
+            root = fetchzip()
         else:
             url = (c.get("src") or "").strip()
             if not re.match(r"^https://[\w.-]+/[\w./~-]+$", url):
@@ -90,28 +111,35 @@ def prep():
         work = os.path.join(root, c.get("sub") or "").rstrip("/")
         if not os.path.isdir(work):
             fail("Subfolder tidak ditemukan.")
-        kind = detect(work)
+        kind = c.get("kind") or detect(work)
         if not kind:
             fail("Jenis proyek tidak dikenali (Flutter, Capacitor, React Native, Gradle Android, atau web).")
-        print("Jenis proyek terdeteksi:", kind)
+        if kind not in ("web", "flutter", "capacitor", "rn", "gradle"):
+            fail("Jenis proyek tidak valid: %s" % kind)
+        print("Jenis proyek:", kind)
     json.dump({"kind": kind, "work": work}, open(STATE, "w"))
     open(os.environ["GITHUB_OUTPUT"], "a").write("kind=%s\n" % kind)
     V = c["var"].capitalize()
-    aab = c["fmt"] == "aab"
-    task = ("bundle" if aab else "assemble") + V
+    aab, both = c["fmt"] == "aab", c["fmt"] == "both"
+    task = ("assemble%s bundle%s" % (V, V)) if both else ("bundle" if aab else "assemble") + V
     args = c.get("args", "")
     me = 'python3 "$GITHUB_WORKSPACE/tools/generate.py"'
     gw = "./gradlew %s %s --no-daemon --stacktrace" % (task, args)
     native = "gradle -p %s %s %s --no-daemon --stacktrace" % (D, task, args)
-    split = "--split-per-abi" if c.get("abi") and not aab else ""
+    split = "--split-per-abi" if c.get("abi") and not (aab or both) else ""
+
+    def fl(b):
+        return "flutter build %s --%s --build-name %s --build-number %d %s %s" % (
+            b, c["var"], shlex.quote(c["vn"]), int(c["vc"]), split if b == "apk" else "", args)
+
+    fcmd = "\n".join(fl(b) for b in (["apk", "appbundle"] if both else ["appbundle"] if aab else ["apk"]))
     scripts = {
         "generated": native,
         "web": native,
         "gradle": 'cd "%s"\n%s patch "$PWD"\nif [ -f gradlew ]; then chmod +x gradlew; %s; else gradle %s %s --no-daemon --stacktrace; fi' % (work, me, gw, task, args),
-        "capacitor": 'cd "%s"\n(npm ci || npm install)\nnpm run build --if-present\nnpx cap sync android\n%s patch "$PWD/android"\ncd android\nchmod +x gradlew\n%s' % (work, me, gw),
+        "capacitor": 'cd "%s"\n(npm ci || npm install)\nnpm run build --if-present\n([ -d android ] || npx cap add android)\nnpx cap sync android\n%s patch "$PWD/android"\ncd android\nchmod +x gradlew\n%s' % (work, me, gw),
         "rn": 'cd "%s"\n(npm ci || npm install)\n[ -d android ] || npx expo prebuild --platform android --no-install\n%s patch "$PWD/android"\ncd android\nchmod +x gradlew\n%s' % (work, me, gw),
-        "flutter": 'cd "%s"\n[ -d android ] || flutter create --platforms=android .\n%s patch "$PWD/android"\nflutter pub get\nflutter build %s --%s --build-name %s --build-number %d %s %s' % (
-            work, me, "appbundle" if aab else "apk", c["var"], shlex.quote(c["vn"]), int(c["vc"]), split, args),
+        "flutter": 'cd "%s"\n[ -d android ] || flutter create --platforms=android .\n%s patch "$PWD/android"\nflutter pub get\n%s' % (work, me, fcmd),
     }
     open(".build.sh", "w").write("set -e\n" + scripts[kind] + "\n")
 
@@ -154,7 +182,7 @@ def gen():
     kind, work = st["kind"], st["work"]
     pkg = c["pkg"]
     name = html.escape(c["name"], quote=False).replace("'", "\\'")
-    aab = c["fmt"] == "aab"
+    aab = c["fmt"] in ("aab", "both")
     minify = bool(c["minify"]) and c["var"] == "release"
     color = c["color"] if re.fullmatch(r"#[0-9a-fA-F]{6}", c["color"]) else "#FFD600"
     perms = set(c["perms"])
@@ -183,7 +211,12 @@ def gen():
           "location": "ACCESS_FINE_LOCATION", "notifications": "POST_NOTIFICATIONS"}
     uses = "\n".join('    <uses-permission android:name="android.permission.%s"/>' % PM[p] for p in sorted(perms) if p in PM)
     orient = {"portrait": "portrait", "landscape": "landscape"}.get(c["orient"], "unspecified")
-    bcf = '        buildConfigField("Boolean", "KIOSK", "%s")\n' % str(bool(c.get("kiosk"))).lower()
+    def bb(k, v):
+        return '        buildConfigField("Boolean", "%s", "%s")\n' % (k, str(bool(v)).lower())
+    sc = c.get("sc") or ""
+    bcf = "".join(bb(k, c.get(f)) for k, f in (("KIOSK", "kiosk"), ("FULLSCREEN", "fs"), ("KEEP_ON", "kp"), ("ZOOM", "zm"), ("EXTERNAL", "ex"), ("OFFLINE", "of"), ("PTR", "pt")))
+    bcf += '        buildConfigField("String", "STATUS_COLOR", %s)\n' % json.dumps(json.dumps(sc if re.fullmatch(r"#[0-9a-fA-F]{6}", sc) else ""))
+    bcf += '        buildConfigField("String", "USER_AGENT", %s)\n' % json.dumps(json.dumps(c.get("ua") or ""))
     for ln in (c.get("bc") or "").splitlines():
         if "=" in ln:
             k, v = ln.split("=", 1)
@@ -257,6 +290,7 @@ android {
 }
 dependencies {
     implementation("androidx.webkit:webkit:1.11.0")
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
 }
 """, PKG=pkg, MIN=max(int(c["min"]), 26), VC=int(c["vc"]), VN=c["vn"].replace('"', ""),
         URL=json.dumps(json.dumps(url)), KP=kp, AL=al, KS=ks.replace("\\", "/"),
@@ -264,7 +298,7 @@ dependencies {
     w("app/proguard-rules.pro", "-keep class @PKG@.** { *; }\n-dontwarn **\n", PKG=pkg)
     w("app/src/main/AndroidManifest.xml", """<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 @USES@
-    <application android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:theme="@style/AppTheme">
+    <application android:usesCleartextTraffic="true" android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:theme="@style/AppTheme">
         <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="@OR@">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
@@ -277,33 +311,71 @@ dependencies {
     w("app/src/main/kotlin/" + pkg.replace(".", "/") + "/MainActivity.kt", """package @PKG@
 
 import android.app.Activity
+import android.content.Intent
+import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.TextView
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.WebViewAssetLoader
 
 class MainActivity : Activity() {
     private var web: WebView? = null
+    private var swipe: SwipeRefreshLayout? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (BuildConfig.STATUS_COLOR.isNotEmpty()) window.statusBarColor = Color.parseColor(BuildConfig.STATUS_COLOR)
         if (BuildConfig.APP_URL.isNotEmpty()) {
             val loader = WebViewAssetLoader.Builder()
                 .addPathHandler("/", WebViewAssetLoader.AssetsPathHandler(this)).build()
             val w = WebView(this)
             w.settings.javaScriptEnabled = true
             w.settings.domStorageEnabled = true
+            w.settings.setSupportZoom(BuildConfig.ZOOM)
+            w.settings.builtInZoomControls = BuildConfig.ZOOM
+            w.settings.displayZoomControls = false
+            if (BuildConfig.USER_AGENT.isNotEmpty()) w.settings.userAgentString = BuildConfig.USER_AGENT
             w.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
                     loader.shouldInterceptRequest(request.url)
+
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                    val u = request.url
+                    val internal = u.host == "appassets.androidplatform.net" || u.host == Uri.parse(BuildConfig.APP_URL).host
+                    if (BuildConfig.EXTERNAL && !internal) {
+                        startActivity(Intent(Intent.ACTION_VIEW, u))
+                        return true
+                    }
+                    return false
+                }
+
+                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                    swipe?.isRefreshing = false
+                    if (BuildConfig.OFFLINE && request.isForMainFrame) view.loadUrl("https://appassets.androidplatform.net/__offline.html")
+                }
+
+                override fun onPageFinished(view: WebView, url: String) {
+                    swipe?.isRefreshing = false
+                }
             }
             web = w
-            setContentView(w)
+            if (BuildConfig.PTR) {
+                val sr = SwipeRefreshLayout(this)
+                sr.addView(w)
+                sr.setOnRefreshListener { w.reload() }
+                swipe = sr
+                setContentView(sr)
+            } else {
+                setContentView(w)
+            }
             w.loadUrl(BuildConfig.APP_URL)
         } else {
             val t = TextView(this)
@@ -312,8 +384,8 @@ class MainActivity : Activity() {
             t.setPadding(48, 96, 48, 48)
             setContentView(t)
         }
-        if (BuildConfig.KIOSK) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (BuildConfig.KIOSK || BuildConfig.KEEP_ON) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (BuildConfig.KIOSK || BuildConfig.FULLSCREEN) {
             window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         }
     }
@@ -324,6 +396,8 @@ class MainActivity : Activity() {
     }
 }
 """, PKG=pkg)
+    if c.get("of"):
+        w("app/src/main/assets/__offline.html", '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;text-align:center"><div><h2>Tidak ada koneksi</h2><p>Periksa internet lalu coba lagi.</p><button style="padding:12px 20px;font-size:16px" onclick="history.back()">Coba lagi</button></div>')
     w("app/src/main/res/values/strings.xml", '<resources><string name="app_name">@N@</string></resources>\n', N=name)
     w("app/src/main/res/values/colors.xml", '<resources><color name="ic_bg">@C@</color></resources>\n', C=color)
     w("app/src/main/res/values/themes.xml", """<resources>
@@ -382,32 +456,63 @@ def sign(f, dst, ext, ks, kp, al):
     os.remove(tmp)
 
 
+def badging(f):
+    import zipfile
+    info = {"pkg": "", "vn": "", "vc": "", "label": "", "assets": 0}
+    try:
+        bt = sorted(glob.glob(os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk") + "/build-tools/*"))[-1]
+        out = subprocess.run([bt + "/aapt2", "dump", "badging", f], capture_output=True, text=True).stdout
+        m = re.search(r"package: name='([^']*)' versionCode='(\d*)' versionName='([^']*)'", out)
+        if m:
+            info["pkg"], info["vc"], info["vn"] = m.groups()
+        lb = re.search(r"application-label:'([^']*)'", out)
+        info["label"] = lb.group(1) if lb else ""
+    except Exception as e:
+        print("aapt2 tidak tersedia:", e)
+    info["assets"] = len([n for n in zipfile.ZipFile(f).namelist() if n.startswith("assets/")])
+    return info
+
+
 def collect():
     st = json.load(open(STATE))
     kind, work = st["kind"], st["work"]
     base = D if kind in ("generated", "web") else work
-    ext = "aab" if c["fmt"] == "aab" else "apk"
-    fs = [f for f in sorted(glob.glob("%s/**/outputs/**/*.%s" % (base, ext), recursive=True)) if "androidTest" not in f]
-    if not fs:
-        fail("Output tidak ditemukan. Periksa log tahap Build.")
+    exts = ["apk", "aab"] if c["fmt"] == "both" else ["aab" if c["fmt"] == "aab" else "apk"]
     ks, kp, al = keystore()
     os.makedirs("dist", exist_ok=True)
     print("::group::Penandatanganan")
-    for f in fs:
-        b = os.path.basename(f)
-        n = c["out"] + ("-" + b[:-len(ext) - 1].replace("-unsigned", "") if len(fs) > 1 else "")
-        dst = "dist/%s.%s" % (n, ext)
-        if "unsigned" in b:
-            sign(f, dst, ext, ks, kp, al)
-            print("Ditandatangani:", dst)
-        else:
-            shutil.copy(f, dst)
-            print("Disalin:", dst)
+    for ext in exts:
+        fs = [f for f in sorted(glob.glob("%s/**/outputs/**/*.%s" % (base, ext), recursive=True)) if "androidTest" not in f]
+        if not fs:
+            fail("Output %s tidak ditemukan. Periksa log tahap Build." % ext.upper())
+        for f in fs:
+            b = os.path.basename(f)
+            n = c["out"] + ("-" + b[:-len(ext) - 1].replace("-unsigned", "") if len(fs) > 1 else "")
+            dst = "dist/%s.%s" % (n, ext)
+            if "unsigned" in b:
+                sign(f, dst, ext, ks, kp, al)
+                print("Ditandatangani:", dst)
+            else:
+                shutil.copy(f, dst)
+                print("Disalin:", dst)
     print("::endgroup::")
+    for x in glob.glob("dist/*.idsig"):
+        os.remove(x)
+    apk = []
+    if "apk" in exts:
+        print("::group::Isi APK")
+        for f in sorted(glob.glob("dist/*.apk")):
+            b = badging(f)
+            b["n"] = os.path.basename(f)
+            apk.append(b)
+            print(b["n"], b["pkg"], b["vn"], b["vc"], b["label"], "aset:", b["assets"])
+        print("::endgroup::")
+        if kind == "web" and any(x["assets"] == 0 for x in apk):
+            fail("APK tidak memuat berkas web. Proyek tidak ikut terbundel.")
     files = [{"n": os.path.basename(f), "size": os.path.getsize(f),
               "sha": hashlib.sha256(open(f, "rb").read()).hexdigest()} for f in sorted(glob.glob("dist/*"))]
     gen = json.load(open(D + "/.gen")) if os.path.exists(D + "/.gen") else []
-    info = {"name": c["name"], "pkg": c["pkg"], "kind": kind, "files": files, "gen": gen}
+    info = {"name": c["name"], "pkg": c["pkg"], "kind": kind, "files": files, "gen": gen, "apk": apk}
     os.makedirs(D, exist_ok=True)
     open(D + "/.notes", "w").write((c.get("notes") or "Build " + os.environ["RUN"]) + "\n\n<!--nexa:" + json.dumps(info) + "-->\n")
     print("::group::Ringkasan")
