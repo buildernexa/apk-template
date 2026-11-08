@@ -1,1 +1,73 @@
-
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Konfigurasi build (JSON)
+        required: true
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CFG: ${{ inputs.config }}
+      RUN: ${{ github.run_number }}
+      KS_B64: ${{ secrets.KEYSTORE_B64 }}
+      KS_PASS: ${{ secrets.KS_PASS }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare source
+        id: prep
+        run: |
+          python3 tools/generate.py prep
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Setup Node
+        if: steps.prep.outputs.kind == 'web' || steps.prep.outputs.kind == 'capacitor' || steps.prep.outputs.kind == 'rn'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Setup Flutter
+        if: steps.prep.outputs.kind == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Generate project
+        if: steps.prep.outputs.kind == 'generated' || steps.prep.outputs.kind == 'web'
+        run: python3 tools/generate.py gen
+      - name: Build
+        run: bash .build.sh
+      - name: Collect output
+        id: collect
+        run: python3 tools/generate.py collect
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: output
+          path: dist/*
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.collect.outputs.tag }}" dist/* --title "${{ steps.collect.outputs.tag }}" --notes-file build_app/.notes
+      - name: Cleanup
+        if: always()
+        run: |
+          ZIP=$(python3 -c 'import json,os;print(json.loads(os.environ["CFG"]).get("zip",""))')
+          if [ -n "$ZIP" ] && [ -f "$ZIP" ]; then
+            git config user.name nexabuild
+            git config user.email nexabuild@users.noreply.github.com
+            git rm -q -f "$ZIP" && git commit -q -m "Hapus ZIP sementara" && git push -q || true
+          fi
