@@ -1,14 +1,52 @@
-import base64, glob, hashlib, html, json, os, re, shlex, shutil, subprocess, sys
+import base64, glob, hashlib, html, json, os, re, shlex, shutil, subprocess, sys, zipfile
+from xml.sax.saxutils import escape as xml_escape
 
-NEXA_TPL = 5
+NEXA_TPL = 6
 
-c = json.loads(os.environ["CFG"])
+try:
+    c = json.loads(os.environ.get("CFG", "{}"))
+except json.JSONDecodeError as exc:
+    print("::error::Konfigurasi build bukan JSON yang valid: %s" % exc)
+    sys.exit(2)
+if not isinstance(c, dict):
+    print("::error::Konfigurasi build harus berupa objek JSON.")
+    sys.exit(2)
+DEFAULTS = {
+    "vn": "1.0.0", "vc": 1, "min": 26, "fmt": "apk", "var": "release",
+    "args": "", "abi": False, "perms": [], "color": "#FFD600", "url": "",
+    "orient": "unspecified", "kiosk": False, "fs": False, "kp": False,
+    "zm": False, "ex": False, "of": False, "pt": False, "sc": "", "ua": "",
+    "bc": "", "flv": "", "fb": False, "minify": False, "ov": True,
+    "out": "nexabuild", "notes": "", "ref": "", "sub": "", "src": ""
+}
+for key, value in DEFAULTS.items():
+    c.setdefault(key, value)
 D, W, STATE = "build_app", "src_work", ".nexa.json"
 GEN = []
 
 
-def sh(*a):
-    subprocess.run(list(a), check=True)
+def sh(*a, cwd=None):
+    subprocess.run(list(a), check=True, cwd=cwd)
+
+
+def shell_args(value):
+    try:
+        return " ".join(shlex.quote(x) for x in shlex.split(str(value or "")))
+    except ValueError as exc:
+        fail("Argumen build tidak valid: %s" % exc)
+
+
+def npm_install(root):
+    root = os.path.abspath(root)
+    if not os.path.isfile(os.path.join(root, "package.json")):
+        fail("package.json tidak ditemukan di sumber proyek Node.js.")
+    lock = any(os.path.isfile(os.path.join(root, n)) for n in ("package-lock.json", "npm-shrinkwrap.json"))
+    if lock:
+        print("Menggunakan npm ci berdasarkan lockfile.")
+        sh("npm", "ci", "--no-audit", "--no-fund", cwd=root)
+    else:
+        print("Lockfile npm tidak ditemukan; menggunakan npm install.")
+        sh("npm", "install", "--no-audit", "--no-fund", cwd=root)
 
 
 def fail(m):
@@ -28,8 +66,17 @@ def w(p, t, **k):
 
 def detect(r):
     has = lambda f: os.path.exists(os.path.join(r, f))
-    pk = json.load(open(os.path.join(r, "package.json"))) if has("package.json") else {}
-    deps = {**pk.get("dependencies", {}), **pk.get("devDependencies", {})}
+    try:
+        pk = json.load(open(os.path.join(r, "package.json"), encoding="utf-8")) if has("package.json") else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        fail("package.json tidak bisa dibaca: %s" % exc)
+    if not isinstance(pk, dict):
+        fail("package.json harus berisi objek JSON.")
+    dependencies = pk.get("dependencies") or {}
+    dev_dependencies = pk.get("devDependencies") or {}
+    if not isinstance(dependencies, dict) or not isinstance(dev_dependencies, dict):
+        fail("dependencies dan devDependencies pada package.json harus berupa objek.")
+    deps = {**dependencies, **dev_dependencies}
     if has("pubspec.yaml"):
         return "flutter"
     if any(has("capacitor.config." + e) for e in ("ts", "json", "js")):
@@ -46,7 +93,14 @@ def detect(r):
 def keystore():
     ks = os.path.abspath("release.jks")
     if os.environ.get("KS_B64"):
-        open(ks, "wb").write(base64.b64decode(os.environ["KS_B64"]))
+        try:
+            raw = base64.b64decode(os.environ["KS_B64"], validate=True)
+            if not raw:
+                raise ValueError("file kosong")
+            with open(ks, "wb") as stream:
+                stream.write(raw)
+        except Exception as exc:
+            fail("Secret KEYSTORE_B64 bukan Base64 keystore yang valid: %s" % exc)
         kp = os.environ.get("KS_PASS") or "android123"
         al = os.environ.get("KEY_ALIAS") or "key"
         print("Keystore: dari secrets")
@@ -60,14 +114,36 @@ def keystore():
 
 
 def unzip(z=None):
-    import zipfile
     if z is None:
         z = c.get("zip", "")
-        if not re.match(r"^uploads/[\w.-]+\.zip$", z) or not os.path.exists(z):
+        if not re.fullmatch(r"uploads/[\w.-]+\.zip", z) or not os.path.isfile(z):
             fail("File ZIP tidak ditemukan di repo. Unggah ulang dari tab Build.")
+    if not zipfile.is_zipfile(z):
+        fail("File sumber bukan ZIP yang valid atau arsipnya rusak.")
+    if os.path.exists(W):
+        shutil.rmtree(W)
+    os.makedirs(W, exist_ok=True)
     print("::group::Mengekstrak ZIP")
-    zipfile.ZipFile(z).extractall(W)
+    total = 0
+    with zipfile.ZipFile(z) as archive:
+        entries = archive.infolist()
+        if len(entries) > 20000:
+            fail("ZIP berisi terlalu banyak entri (maksimal 20.000).")
+        for info in entries:
+            name = info.filename.replace("\\", "/")
+            parts = name.split("/")
+            mode = (info.external_attr >> 16) & 0o170000
+            if name.startswith("/") or re.match(r"^[A-Za-z]:", name) or ".." in parts:
+                fail("ZIP ditolak: ditemukan path di luar folder proyek.")
+            if mode == 0o120000:
+                fail("ZIP ditolak: symbolic link tidak didukung.")
+            total += info.file_size
+            if total > 500 * 1024 * 1024:
+                fail("Ukuran hasil ekstraksi ZIP melebihi batas 500 MB.")
+        archive.extractall(W)
     items = [x for x in os.listdir(W) if x != "__MACOSX"]
+    if not items:
+        fail("ZIP kosong.")
     print("Isi ZIP:", ", ".join(items[:12]))
     print("::endgroup::")
     one = os.path.join(W, items[0]) if len(items) == 1 else ""
@@ -90,58 +166,97 @@ def fetchzip():
 def prep():
     sr = c.get("sr")
     if sr not in ("scratch", "repo", "zip", "ziplink"):
-        fail("Konfigurasi sumber proyek tidak dikenali. Sinkronkan repo build dengan template terbaru (tombol di tab Build).")
+        fail("Konfigurasi sumber proyek tidak dikenali. Sinkronkan repo build dengan template terbaru.")
     kind, work = "generated", "."
     if sr in ("repo", "zip", "ziplink"):
         root = W
+        if sr == "repo" and os.path.exists(W):
+            shutil.rmtree(W)
         if sr == "zip":
             root = unzip()
         elif sr == "ziplink":
             root = fetchzip()
         else:
             url = (c.get("src") or "").strip()
-            if not re.match(r"^https://[\w.-]+/[\w./~-]+$", url):
-                fail("URL repo tidak valid. Gunakan alamat https.")
+            if not re.fullmatch(r"https://[\w.-]+/[\w./~-]+", url):
+                fail("URL repo tidak valid. Gunakan alamat HTTPS Git.")
             tok = os.environ.get("SRC_TOKEN")
             if tok and url.startswith("https://github.com/"):
                 url = url.replace("https://", "https://x-access-token:%s@" % tok, 1)
             print("::group::Mengambil repo")
-            sh("git", "clone", "--depth", "1", *(["--branch", c["ref"]] if c.get("ref") else []), url, W)
+            args = ["git", "clone", "--depth", "1"]
+            if c.get("ref"):
+                args += ["--branch", str(c["ref"])]
+            args += [url, W]
+            sh(*args)
             print("::endgroup::")
-        work = os.path.join(root, c.get("sub") or "").rstrip("/")
+        sub = str(c.get("sub") or "").strip().replace("\\", "/").strip("/")
+        if sub and (".." in sub.split("/") or sub.startswith("/")):
+            fail("Subfolder proyek tidak valid.")
+        root_abs = os.path.abspath(root)
+        work = os.path.abspath(os.path.join(root_abs, sub)) if sub else root_abs
+        if os.path.commonpath([root_abs, work]) != root_abs:
+            fail("Subfolder proyek berada di luar sumber proyek.")
         if not os.path.isdir(work):
-            fail("Subfolder tidak ditemukan.")
+            fail("Subfolder tidak ditemukan: %s" % (c.get("sub") or "(root)"))
         kind = c.get("kind") or detect(work)
         if not kind:
             fail("Jenis proyek tidak dikenali (Flutter, Capacitor, React Native, Gradle Android, atau web).")
         if kind not in ("web", "flutter", "capacitor", "rn", "gradle"):
             fail("Jenis proyek tidak valid: %s" % kind)
+        if kind == "rn" and not os.path.isdir(os.path.join(work, "android")):
+            try:
+                package = json.load(open(os.path.join(work, "package.json"), encoding="utf-8"))
+            except Exception:
+                package = {}
+            dependencies = package.get("dependencies") or {}
+            dev_dependencies = package.get("devDependencies") or {}
+            if not isinstance(dependencies, dict) or not isinstance(dev_dependencies, dict):
+                fail("dependencies dan devDependencies pada package.json harus berupa objek.")
+            deps = {**dependencies, **dev_dependencies}
+            if "expo" not in deps:
+                fail("Proyek React Native tanpa folder android harus memakai Expo agar prebuild dapat membuat proyek Android.")
         print("Jenis proyek:", kind)
     json.dump({"kind": kind, "work": work}, open(STATE, "w"))
-    open(os.environ["GITHUB_OUTPUT"], "a").write("kind=%s\n" % kind)
-    V = c["var"].capitalize()
-    aab, both = c["fmt"] == "aab", c["fmt"] == "both"
-    task = ("assemble%s bundle%s" % (V, V)) if both else ("bundle" if aab else "assemble") + V
-    args = c.get("args", "")
+    with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+        output.write("kind=%s\n" % kind)
+
+    variant = str(c.get("var", "release")).capitalize()
+    fmt = c.get("fmt", "apk")
+    tasks = ["assemble" + variant, "bundle" + variant] if fmt == "both" else ["bundle" + variant] if fmt == "aab" else ["assemble" + variant]
+    args = shell_args(c.get("args", ""))
+    task_args = " ".join(shlex.quote(t) for t in tasks)
+    extra = (" " + args) if args else ""
     me = 'python3 "$GITHUB_WORKSPACE/tools/generate.py"'
-    gw = "./gradlew %s %s --no-daemon --stacktrace" % (task, args)
-    native = "gradle -p %s %s %s --no-daemon --stacktrace" % (D, task, args)
-    split = "--split-per-abi" if c.get("abi") and not (aab or both) else ""
+    work_q = shlex.quote(work)
+    native = "gradle -p build_app %s%s --no-daemon --stacktrace" % (task_args, extra)
+    gw = "./gradlew %s%s --no-daemon --stacktrace" % (task_args, extra)
+    split = "--split-per-abi" if c.get("abi") and fmt not in ("aab", "both") else ""
 
-    def fl(b):
-        return "flutter build %s --%s --build-name %s --build-number %d %s %s" % (
-            b, c["var"], shlex.quote(c["vn"]), int(c["vc"]), split if b == "apk" else "", args)
+    def fl(build_type):
+        pieces = ["flutter", "build", build_type, "--" + str(c.get("var", "release")),
+                  "--build-name", str(c.get("vn", "1.0.0")), "--build-number", str(int(c.get("vc", 1)))]
+        if build_type == "apk" and split:
+            pieces.append(split)
+        pieces.extend(shlex.split(str(c.get("args", ""))))
+        return " ".join(shlex.quote(x) for x in pieces)
 
-    fcmd = "\n".join(fl(b) for b in (["apk", "appbundle"] if both else ["appbundle"] if aab else ["apk"]))
+    flutter_cmd = "\n".join(fl(x) for x in (["apk", "appbundle"] if fmt == "both" else ["appbundle"] if fmt == "aab" else ["apk"]))
     scripts = {
         "generated": native,
         "web": native,
-        "gradle": 'cd "%s"\n%s patch "$PWD"\nif [ -f gradlew ]; then chmod +x gradlew; %s; else gradle %s %s --no-daemon --stacktrace; fi' % (work, me, gw, task, args),
-        "capacitor": 'cd "%s"\n(npm ci || npm install)\nnpm run build --if-present\n([ -d android ] || npx cap add android)\nnpx cap sync android\n%s patch "$PWD/android"\ncd android\nchmod +x gradlew\n%s' % (work, me, gw),
-        "rn": 'cd "%s"\n(npm ci || npm install)\n[ -d android ] || npx expo prebuild --platform android --no-install\n%s patch "$PWD/android"\ncd android\nchmod +x gradlew\n%s' % (work, me, gw),
-        "flutter": 'cd "%s"\n[ -d android ] || flutter create --platforms=android .\n%s patch "$PWD/android"\nflutter pub get\n%s' % (work, me, fcmd),
+        "gradle": 'cd %s\n%s patch "$PWD"\nif [ -f gradlew ]; then chmod +x gradlew; %s; else gradle %s%s --no-daemon --stacktrace; fi' % (work_q, me, gw, task_args, extra),
+        "capacitor": 'cd %s\nnpm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund\nnpm run build --if-present\n[ -d android ] || npx cap add android\nnpx cap sync android\n%s patch "$PWD/android"\ncd android\nchmod +x gradlew\n%s' % (work_q, me, gw),
+        "rn": 'cd %s\nnpm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund\n[ -d android ] || npx expo prebuild --platform android --no-install\n%s patch "$PWD/android"\ncd android\nchmod +x gradlew\n%s' % (work_q, me, gw),
+        "flutter": 'cd %s\n[ -d android ] || flutter create --platforms=android .\n%s patch "$PWD/android"\nflutter pub get\n%s' % (work_q, me, flutter_cmd),
     }
-    open(".build.sh", "w").write("set -e\n" + scripts[kind] + "\n")
+    # Node projects use deterministic lockfile installs; do not mask an npm ci failure.
+    if kind in ("capacitor", "rn"):
+        node_setup = 'if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi'
+        scripts[kind] = scripts[kind].replace('npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund', node_setup)
+    with open(".build.sh", "w", encoding="utf-8") as build_script:
+        build_script.write("#!/usr/bin/env bash\nset -Eeuo pipefail\n" + scripts[kind] + "\n")
+    os.chmod(".build.sh", 0o755)
 
 
 def patch(d):
@@ -180,8 +295,10 @@ def patch(d):
 def gen():
     st = json.load(open(STATE))
     kind, work = st["kind"], st["work"]
-    pkg = c["pkg"]
-    name = html.escape(c["name"], quote=False).replace("'", "\\'")
+    if os.path.exists(D):
+        shutil.rmtree(D)
+    pkg = str(c["pkg"])
+    name = xml_escape(str(c["name"]), {"\"": "&quot;", "'": "&apos;"})
     aab = c["fmt"] in ("aab", "both")
     minify = bool(c["minify"]) and c["var"] == "release"
     color = c["color"] if re.fullmatch(r"#[0-9a-fA-F]{6}", c["color"]) else "#FFD600"
@@ -195,8 +312,15 @@ def gen():
     if kind == "web":
         pj = os.path.join(work, "package.json")
         if os.path.exists(pj):
-            has_build = "build" in json.load(open(pj)).get("scripts", {})
-            sh("bash", "-c", 'cd "%s" && (npm ci || npm install)%s' % (work, " && npm run build" if has_build else ""))
+            package = json.load(open(pj, encoding="utf-8"))
+            if not isinstance(package, dict):
+                fail("package.json harus berisi objek JSON.")
+            scripts = package.get("scripts") or {}
+            if not isinstance(scripts, dict):
+                fail("scripts pada package.json harus berupa objek.")
+            npm_install(work)
+            if "build" in scripts:
+                sh("npm", "run", "build", cwd=work)
         out = next((os.path.join(work, x) for x in ("dist", "build", "out", "public", "www")
                     if os.path.exists(os.path.join(work, x, "index.html"))), work)
         if not os.path.exists(os.path.join(out, "index.html")):
@@ -217,14 +341,18 @@ def gen():
     bcf = "".join(bb(k, c.get(f)) for k, f in (("KIOSK", "kiosk"), ("FULLSCREEN", "fs"), ("KEEP_ON", "kp"), ("ZOOM", "zm"), ("EXTERNAL", "ex"), ("OFFLINE", "of"), ("PTR", "pt")))
     bcf += '        buildConfigField("String", "STATUS_COLOR", %s)\n' % json.dumps(json.dumps(sc if re.fullmatch(r"#[0-9a-fA-F]{6}", sc) else ""))
     bcf += '        buildConfigField("String", "USER_AGENT", %s)\n' % json.dumps(json.dumps(c.get("ua") or ""))
+    used_fields = {"KIOSK", "FULLSCREEN", "KEEP_ON", "ZOOM", "EXTERNAL", "OFFLINE", "PTR", "STATUS_COLOR", "USER_AGENT", "APP_URL"}
     for ln in (c.get("bc") or "").splitlines():
         if "=" in ln:
             k, v = ln.split("=", 1)
             k = re.sub(r"[^A-Z0-9_]", "_", k.strip().upper())
-            if k:
+            if k and not re.match(r"^[A-Z_]", k):
+                k = "_" + k
+            if k and k not in used_fields:
+                used_fields.add(k)
                 bcf += '        buildConfigField("String", "%s", %s)\n' % (k, json.dumps(json.dumps(v.strip())))
     fl = [re.sub(r"[^a-z0-9]", "", x.strip().lower()) for x in (c.get("flv") or "").split(",")]
-    fl = [x for x in fl if x and x[0].isalpha()]
+    fl = list(dict.fromkeys(x for x in fl if x and x[0].isalpha()))
     flv = ""
     if fl:
         flv = 'flavorDimensions += "tier"\n    productFlavors {\n' + "".join(
@@ -293,7 +421,7 @@ dependencies {
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
 }
 """, PKG=pkg, MIN=max(int(c["min"]), 26), VC=int(c["vc"]), VN=c["vn"].replace('"', ""),
-        URL=json.dumps(json.dumps(url)), KP=kp, AL=al, KS=ks.replace("\\", "/"),
+        URL=json.dumps(json.dumps(url)), KP=json.dumps(kp)[1:-1], AL=json.dumps(al)[1:-1], KS=ks.replace("\\", "/").replace('"', '\\"'),
         MF=str(minify).lower(), ABI=str(bool(c["abi"]) and not aab).lower(), BCF=bcf, FLV=flv)
     w("app/proguard-rules.pro", "-keep class @PKG@.** { *; }\n-dontwarn **\n", PKG=pkg)
     w("app/src/main/AndroidManifest.xml", """<manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -420,8 +548,7 @@ class MainActivity : Activity() {
         try:
             from PIL import Image
         except ImportError:
-            sh(sys.executable, "-m", "pip", "install", "-q", "pillow")
-            from PIL import Image
+            fail("Pillow belum tersedia. Jalankan instalasi tools/requirements.txt sebelum generate.")
         im = Image.open("assets/icon.png").convert("RGBA").resize((288, 288))
         cv = Image.new("RGBA", (432, 432), (0, 0, 0, 0))
         cv.paste(im, (72, 72), im)
@@ -447,12 +574,17 @@ def sign(f, dst, ext, ks, kp, al):
     if ext == "aab":
         shutil.copy(f, dst)
         sh("jarsigner", "-keystore", ks, "-storepass", kp, "-keypass", kp, dst, al)
+        sh("jarsigner", "-verify", dst)
         return
-    bt = sorted(glob.glob(os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk") + "/build-tools/*"))[-1]
+    tools = sorted(glob.glob(os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk") + "/build-tools/*"))
+    if not tools:
+        fail("Android Build Tools tidak ditemukan. Periksa langkah Setup Android SDK.")
+    bt = tools[-1]
     tmp = dst + ".aligned"
     sh(bt + "/zipalign", "-f", "-p", "4", f, tmp)
     sh(bt + "/apksigner", "sign", "--ks", ks, "--ks-pass", "pass:" + kp, "--key-pass", "pass:" + kp,
        "--ks-key-alias", al, "--v4-signing-enabled", "false", "--out", dst, tmp)
+    sh(bt + "/apksigner", "verify", "--verbose", dst)
     os.remove(tmp)
 
 
@@ -460,8 +592,14 @@ def badging(f):
     import zipfile
     info = {"pkg": "", "vn": "", "vc": "", "label": "", "assets": 0}
     try:
-        bt = sorted(glob.glob(os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk") + "/build-tools/*"))[-1]
-        out = subprocess.run([bt + "/aapt2", "dump", "badging", f], capture_output=True, text=True).stdout
+        tools = sorted(glob.glob(os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk") + "/build-tools/*"))
+        if not tools:
+            fail("Android Build Tools tidak ditemukan saat memeriksa APK.")
+        bt = tools[-1]
+        result = subprocess.run([bt + "/aapt2", "dump", "badging", f], capture_output=True, text=True)
+        if result.returncode != 0:
+            fail("APK tidak bisa dibaca oleh aapt2: " + (result.stderr[-1200:] or f))
+        out = result.stdout
         m = re.search(r"package: name='([^']*)' versionCode='(\d*)' versionName='([^']*)'", out)
         if m:
             info["pkg"], info["vc"], info["vn"] = m.groups()
@@ -494,7 +632,14 @@ def collect():
                 print("Ditandatangani:", dst)
             else:
                 shutil.copy(f, dst)
-                print("Disalin:", dst)
+                if ext == "apk":
+                    tools = sorted(glob.glob(os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk") + "/build-tools/*"))
+                    if not tools:
+                        fail("Android Build Tools tidak ditemukan saat verifikasi tanda tangan APK.")
+                    sh(tools[-1] + "/apksigner", "verify", "--verbose", dst)
+                else:
+                    sh("jarsigner", "-verify", dst)
+                print("Disalin dan diverifikasi:", dst)
     print("::endgroup::")
     for x in glob.glob("dist/*.idsig"):
         os.remove(x)
@@ -509,8 +654,13 @@ def collect():
         print("::endgroup::")
         if kind == "web" and any(x["assets"] == 0 for x in apk):
             fail("APK tidak memuat berkas web. Proyek tidak ikut terbundel.")
-    files = [{"n": os.path.basename(f), "size": os.path.getsize(f),
-              "sha": hashlib.sha256(open(f, "rb").read()).hexdigest()} for f in sorted(glob.glob("dist/*"))]
+    files = []
+    for path in sorted(glob.glob("dist/*")):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files.append({"n": os.path.basename(path), "size": os.path.getsize(path), "sha": digest.hexdigest()})
     gen = json.load(open(D + "/.gen")) if os.path.exists(D + "/.gen") else []
     info = {"name": c["name"], "pkg": c["pkg"], "kind": kind, "files": files, "gen": gen, "apk": apk}
     os.makedirs(D, exist_ok=True)
@@ -522,7 +672,47 @@ def collect():
     open(os.environ["GITHUB_OUTPUT"], "a").write("tag=v%s-%s\n" % (c["vn"], os.environ["RUN"]))
 
 
+def validate_config():
+    required = ("name", "pkg")
+    missing = [key for key in required if key not in c]
+    if missing:
+        fail("Konfigurasi tidak lengkap: " + ", ".join(missing))
+    if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", str(c["pkg"])):
+        fail("Package name tidak valid. Gunakan format seperti com.contoh.aplikasi.")
+    if c["fmt"] not in ("apk", "aab", "both"):
+        fail("Format build harus apk, aab, atau both.")
+    if c["var"] not in ("debug", "release"):
+        fail("Varian build harus debug atau release.")
+    if c.get("perms") is not None and not isinstance(c.get("perms"), list):
+        fail("Daftar izin aplikasi harus berupa array.")
+    if c.get("args") and not isinstance(c.get("args"), str):
+        fail("Argumen Gradle harus berupa teks.")
+    try:
+        min_sdk, version_code = int(c["min"]), int(c["vc"])
+    except (TypeError, ValueError):
+        fail("minSdk dan versionCode harus berupa angka bulat.")
+    if min_sdk < 26 or min_sdk > 34:
+        fail("minSdk harus berada di rentang 26–34 untuk template ini.")
+    if version_code < 1:
+        fail("versionCode harus minimal 1.")
+    if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,49}", str(c["vn"])):
+        fail("versionName berisi karakter yang tidak didukung.")
+    if not isinstance(c["name"], str) or not c["name"].strip() or len(c["name"]) > 80:
+        fail("Nama aplikasi wajib diisi dan maksimal 80 karakter.")
+    if not isinstance(c["pkg"], str):
+        fail("Package name harus berupa teks.")
+    if version_code > 2100000000:
+        fail("versionCode melebihi batas Android (2.100.000.000).")
+    if not isinstance(c.get("out"), str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", c["out"]):
+        fail("Nama file output hanya boleh berisi huruf, angka, titik, garis bawah, dan tanda hubung.")
+    for field in ("args", "flv", "bc", "notes", "url", "src", "sub", "ref"):
+        if not isinstance(c.get(field), str):
+            fail("Field %s harus berupa teks." % field)
+
+
 cmd = sys.argv[1] if len(sys.argv) > 1 else "gen"
+if cmd in ("prep", "gen", "collect"):
+    validate_config()
 if cmd == "prep":
     prep()
 elif cmd == "patch":
